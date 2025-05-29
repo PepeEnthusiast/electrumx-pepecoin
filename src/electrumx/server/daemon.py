@@ -13,7 +13,7 @@ import itertools
 import time
 from calendar import timegm
 from struct import pack
-from typing import TYPE_CHECKING, Type
+from typing import TYPE_CHECKING, Type, Sequence
 
 import aiohttp
 from aiorpcx import JSONRPC
@@ -240,7 +240,7 @@ class Daemon:
             self.available_rpcs[method] = available
         return available
 
-    async def block_hex_hashes(self, first, count):
+    async def block_hex_hashes(self, first, count) -> Sequence[str]:
         '''Return the hex hashes of count block starting at height first.'''
         params_iterable = ((h, ) for h in range(first, first + count))
         return await self._send_vector('getblockhash', params_iterable)
@@ -249,7 +249,7 @@ class Daemon:
         '''Return the deserialised block with the given hex hash.'''
         return await self._send_single('getblock', (hex_hash, True))
 
-    async def raw_blocks(self, hex_hashes):
+    async def raw_blocks(self, hex_hashes: Sequence[str]) -> Sequence[bytes]:
         '''Return the raw binary blocks with the given hex hashes.'''
         params_iterable = ((h, False) for h in hex_hashes)
         blocks = await self._send_vector('getblock', params_iterable)
@@ -309,6 +309,10 @@ class Daemon:
     async def broadcast_transaction(self, raw_tx):
         '''Broadcast a transaction to the network.'''
         return await self._send_single('sendrawtransaction', (raw_tx, ))
+
+    async def broadcast_package(self, raw_txs: Sequence[str]):
+        """Broadcast a package of transactions to the network using 'submitpackage'."""
+        return await self._send_single('submitpackage', (raw_txs, ))
 
     async def height(self):
         '''Query the daemon for its current height.'''

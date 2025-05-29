@@ -18,8 +18,7 @@ import time
 from collections import defaultdict
 from functools import partial
 from ipaddress import IPv4Address, IPv6Address, IPv4Network, IPv6Network
-from typing import Optional, TYPE_CHECKING
-import asyncio
+from typing import Optional, TYPE_CHECKING, Sequence
 
 import attr
 from aiorpcx import (Event, JSONRPCAutoDetect, JSONRPCConnection,
@@ -32,7 +31,7 @@ import electrumx.lib.util as util
 from electrumx.lib.lrucache import LRUCache
 from electrumx.lib.util import OldTaskGroup
 from electrumx.lib.hash import (HASHX_LEN, Base58Error, hash_to_hex_str,
-                                hex_str_to_hash, sha256)
+                                hex_str_to_hash, sha256, double_sha256)
 from electrumx.lib.merkle import MerkleCache
 from electrumx.lib.text import sessions_lines
 from electrumx.server.daemon import DaemonError
@@ -122,9 +121,10 @@ class SessionManager:
 
     def __init__(
             self,
+            *,
             env: 'Env',
             db: 'DB',
-            bp: 'BlockProcessor',
+            block_processor: 'BlockProcessor',
             daemon: 'Daemon',
             mempool: 'MemPool',
             shutdown_event: asyncio.Event,
@@ -132,7 +132,7 @@ class SessionManager:
         env.max_send = max(350000, env.max_send)
         self.env = env
         self.db = db
-        self.bp = bp
+        self.bp = block_processor
         self.daemon = daemon
         self.mempool = mempool
         self.peer_mgr = PeerManager(env, db)
@@ -147,15 +147,9 @@ class SessionManager:
         self._method_counts = defaultdict(int)
         self._reorg_count = 0
         self._history_cache = LRUCache(maxsize=1000)
-        self._history_lookups = 0
-        self._history_hits = 0
-        self._tx_hashes_cache = LRUCache(maxsize=1000)
-        self._tx_hashes_lookups = 0
-        self._tx_hashes_hits = 0
+        self._txids_cache = LRUCache(maxsize=1000)
         # Really a MerkleCache cache
-        self._merkle_cache = LRUCache(maxsize=1000)
-        self._merkle_lookups = 0
-        self._merkle_hits = 0
+        self._merkle_txid_cache = LRUCache(maxsize=1000)
         self.estimatefee_cache = LRUCache(maxsize=1000)
         self.notified_height = None
         self.hsub_results = None
@@ -194,8 +188,14 @@ class SessionManager:
             else:
                 serve = serve_rs
             # FIXME: pass the service not the kind
-            session_factory = partial(session_class, self, self.db, self.mempool,
-                                      self.peer_mgr, kind)
+            session_factory = partial(
+                session_class,
+                session_mgr=self,
+                db=self.db,
+                mempool=self.mempool,
+                peer_mgr=self.peer_mgr,
+                kind=kind,
+            )
             host = None if service.host == 'all_interfaces' else str(service.host)
             try:
                 self.servers[service] = await serve(session_factory, host,
@@ -280,8 +280,9 @@ class SessionManager:
             await self.bp.backed_up_event.wait()
             self.logger.info(f'reorg signalled; clearing tx_hashes and merkle caches')
             self._reorg_count += 1
-            self._tx_hashes_cache.clear()
-            self._merkle_cache.clear()
+            # not: history_cache is cleared in _notify_sessions
+            self._txids_cache.clear()
+            self._merkle_txid_cache.clear()
 
     async def _recalc_concurrency(self):
         '''Periodically recalculate session concurrency.'''
@@ -311,7 +312,8 @@ class SessionManager:
 
     def _get_info(self):
         '''A summary of server state.'''
-        cache_fmt = '{:,d} lookups {:,d} hits {:,d} entries'
+        def cache_fmt(cache: LRUCache):
+            return f"{cache.num_lookups} lookups, {cache.num_hits} hits, {len(cache)} entries"
         sessions = self.sessions
         return {
             'coin': self.env.coin.__name__,
@@ -320,10 +322,8 @@ class SessionManager:
             'db height': self.db.db_height,
             'db_flush_count': self.db.history.flush_count,
             'groups': len(self.session_groups),
-            'history cache': cache_fmt.format(
-                self._history_lookups, self._history_hits, len(self._history_cache)),
-            'merkle cache': cache_fmt.format(
-                self._merkle_lookups, self._merkle_hits, len(self._merkle_cache)),
+            'history cache': cache_fmt(self._history_cache),
+            'merkle txid cache': cache_fmt(self._merkle_txid_cache),
             'pid': os.getpid(),
             'peers': self.peer_mgr.info(),
             'request counts': self._method_counts,
@@ -336,8 +336,7 @@ class SessionManager:
                 'pending requests': sum(s.unanswered_request_count() for s in sessions),
                 'subs': sum(s.sub_count() for s in sessions),
             },
-            'tx hashes cache': cache_fmt.format(
-                self._tx_hashes_lookups, self._tx_hashes_hits, len(self._tx_hashes_cache)),
+            'txids cache': cache_fmt(self._txids_cache),
             'txs sent': self.txs_sent,
             'uptime': util.formatted_time(time.time() - self.start_time),
             'version': electrumx.version,
@@ -695,17 +694,17 @@ class SessionManager:
         cost = tx_hash_count
 
         if tx_hash_count >= 200:
-            self._merkle_lookups += 1
-            merkle_cache = self._merkle_cache.get(height)
+            self._merkle_txid_cache.num_lookups += 1
+            merkle_cache = self._merkle_txid_cache.get(height)
             if merkle_cache:
-                self._merkle_hits += 1
+                self._merkle_txid_cache.num_hits += 1
                 cost = 10 * math.sqrt(tx_hash_count)
             else:
                 async def tx_hashes_func(start, count):
                     return tx_hashes[start: start + count]
 
                 merkle_cache = MerkleCache(self.db.merkle, tx_hashes_func)
-                self._merkle_cache[height] = merkle_cache
+                self._merkle_txid_cache[height] = merkle_cache
                 await merkle_cache.initialize(len(tx_hashes))
             branch, _root = await merkle_cache.branch_and_root(tx_hash_count, tx_pos)
         else:
@@ -742,10 +741,10 @@ class SessionManager:
         tx_hashes is an ordered list of binary hashes, cost is an estimated cost of
         getting the hashes; cheaper if in-cache.  Raises RPCError.
         '''
-        self._tx_hashes_lookups += 1
-        tx_hashes = self._tx_hashes_cache.get(height)
+        self._txids_cache.num_lookups += 1
+        tx_hashes = self._txids_cache.get(height)
         if tx_hashes:
-            self._tx_hashes_hits += 1
+            self._txids_cache.num_hits += 1
             return tx_hashes, 0.1
 
         # Ensure the tx_hashes are fresh before placing in the cache
@@ -758,7 +757,7 @@ class SessionManager:
             if reorg_count == self._reorg_count:
                 break
 
-        self._tx_hashes_cache[height] = tx_hashes
+        self._txids_cache[height] = tx_hashes
 
         return tx_hashes, 0.25 + len(tx_hashes) * 0.0001
 
@@ -786,6 +785,11 @@ class SessionManager:
         self.txs_sent += 1
         return hex_hash
 
+    async def broadcast_package(self, tx_package: Sequence[str]) -> dict:
+        result = await self.daemon.broadcast_package(tx_package)
+        self.txs_sent += len(tx_package)
+        return result
+
     async def limited_history(self, hashX):
         '''Returns a pair (history, cost).
 
@@ -794,10 +798,10 @@ class SessionManager:
         # as JSON.
         limit = self.env.max_send // 99
         cost = 0.1
-        self._history_lookups += 1
+        self._history_cache.num_lookups += 1
         try:
             result = self._history_cache[hashX]
-            self._history_hits += 1
+            self._history_cache.num_hits += 1
         except KeyError:
             result = await self.db.limited_history(hashX, limit=limit)
             cost += 0.1 + len(result) * 0.001
@@ -882,12 +886,13 @@ class SessionBase(RPCSession):
 
     def __init__(
             self,
+            transport,
+            *,
             session_mgr: 'SessionManager',
             db: 'DB',
             mempool: 'MemPool',
             peer_mgr: 'PeerManager',
             kind: str,
-            transport,
     ):
         connection = JSONRPCConnection(JSONRPCAutoDetect)
         super().__init__(transport, connection=connection)
@@ -900,6 +905,7 @@ class SessionBase(RPCSession):
         self.coin = self.env.coin
         self.client = 'unknown'
         self.anon_logs = self.env.anon_logs
+        self.taskgroup = OldTaskGroup()
         self.txs_sent = 0
         self.log_me = SessionBase.log_new
         self.session_id = None
@@ -912,6 +918,26 @@ class SessionBase(RPCSession):
                          f'{self.session_mgr.session_count():,d} total')
         self.session_mgr.add_session(self)
         self.recalc_concurrency()  # must be called after session_mgr.add_session
+        asyncio.get_event_loop().create_task(
+            session_mgr._task_group.spawn(self.main_loop()))
+
+    async def main_loop(self):
+        """Manages taskgroup tied to this session.
+        The session and the taskgroup share a lifecycle, either dying will kill the other.
+        This method must not raise, to avoid killing session_mgr._task_group
+        """
+        self.logger.debug("starting taskgroup.")
+        try:
+            async with self.taskgroup as group:
+                await group.spawn(asyncio.Event().wait)  # run forever (until cancel)
+        except Exception as e:
+            self.logger.exception("taskgroup died.")
+        finally:
+            try:
+                await self.close(force_after=1.0)
+            except Exception:
+                self.logger.exception("unexpected exception while closing session")
+            self.logger.debug("taskgroup stopped.")
 
     async def notify(self, touched, height_changed):
         pass
@@ -938,6 +964,7 @@ class SessionBase(RPCSession):
 
     async def connection_lost(self):
         '''Handle client disconnection.'''
+        await self.taskgroup.cancel_remaining()
         await super().connection_lost()
         self.session_mgr.remove_session(self)
         msg = ''
@@ -972,6 +999,9 @@ class SessionBase(RPCSession):
         self.session_mgr._method_counts[method] += 1
         coro = handler_invocation(handler, request)()
         return await coro
+
+    def protocol_version_string(self) -> str:
+        raise NotImplementedError()
 
 
 class ElectrumX(SessionBase):
@@ -1468,6 +1498,51 @@ class ElectrumX(SessionBase):
             self.logger.info(f'sent tx: {hex_hash}')
             return hex_hash
 
+    async def package_broadcast(self, tx_package: Sequence[str], verbose: bool = False) -> dict:
+        """Broadcast a package of raw transactions to the network (submitpackage).
+        The package must consist of a child with its parents,
+        and none of the parents may depend on one another.
+
+        raw_txs: a list of raw transactions as hexadecimal strings"""
+        self.bump_cost(0.25 + sum(len(tx) / 5000 for tx in tx_package))
+        try:
+            txids = [double_sha256(bytes.fromhex(tx)).hex() for tx in tx_package]
+        except ValueError:
+            self.logger.info(f"error calculating txids", exc_info=True)
+            raise RPCError(
+                BAD_REQUEST,
+                f'not a valid hex encoded transaction package: {tx_package}')
+        try:
+            daemon_result = await self.session_mgr.broadcast_package(tx_package)
+        except DaemonError as e:
+            error, = e.args
+            message = error['message']
+            self.logger.info(f"error submitting package: {message}")
+            raise RPCError(BAD_REQUEST, 'the tx package was rejected by '
+                           f'network rules.\n\n{message}. Package txids: {txids}')
+        else:
+            self.txs_sent += len(tx_package)
+            self.logger.info(f'broadcasted package: {txids}')
+            if verbose:
+                return daemon_result
+            errors = []
+            for tx in daemon_result.get('tx-results', {}).values():
+                if tx.get('error'):
+                    error_msg = {
+                        'txid': tx.get('txid'),
+                        'error': tx['error']
+                    }
+                    errors.append(error_msg)
+            # check both, package_msg and package-msg due to ongoing discussion to change rpc
+            # https://github.com/bitcoin/bitcoin/pull/31900
+            package_msg = daemon_result.get('package_msg', daemon_result.get('package-msg'))
+            electrumx_result = {
+                'success': True if package_msg == 'success' else False
+            }
+            if errors:
+                electrumx_result['errors'] = errors
+            return electrumx_result
+
     async def transaction_get(self, tx_hash, verbose=False):
         '''Return the serialized raw transaction given its hash
 
@@ -1556,6 +1631,9 @@ class ElectrumX(SessionBase):
         if ptuple >= (1, 4, 2):
             handlers['blockchain.scripthash.unsubscribe'] = self.scripthash_unsubscribe
 
+        # experimental:
+        handlers['blockchain.transaction.broadcast_package'] = self.package_broadcast
+
         self.request_handlers = handlers
 
 
@@ -1571,6 +1649,11 @@ class LocalRPC(SessionBase):
 
     def protocol_version_string(self):
         return 'RPC'
+
+
+######################################################################
+# Non-Bitcoin stuff goes strictly below this line.
+######################################################################
 
 
 class DashElectrumX(ElectrumX):
